@@ -12,6 +12,7 @@ from stable_baselines3 import PPO
 
 from kinematic_uuv.env import KNOT_MPS, KinematicUUVEnv
 from kinematic_uuv.policy import BoundedActorCriticPolicy, SonarCNNFeaturesExtractor
+from kinematic_uuv.runtime import configure_torch, resolve_device
 
 
 def _load_config(model_path):
@@ -38,7 +39,7 @@ def _make_env(config, episode_steps):
         min_turn_radius=config.get("min_turn_radius_m", 25.0),
         max_pitch_rate=config.get("max_pitch_rate_rad_s", 0.20),
         max_pitch=config.get("max_pitch_rad", 0.35),
-        goal_radius=config.get("goal_radius_m", 12.0),
+        goal_radius=config.get("goal_radius_m", 5.0),
         obstacle_count_range=tuple(config.get("obstacle_count_range", [2, 6])),
         goal_distance_range=tuple(config.get("goal_distance_range_m", [120, 450])),
         dijkstra_resolution=config.get("dijkstra_resolution_m", 8.0),
@@ -202,6 +203,8 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save-trajectories", action=argparse.BooleanOptionalAction,
                         default=True)
+    parser.add_argument("--device", default="cuda",
+                        help="PyTorch device: cuda, cuda:0, cpu, or auto")
     args = parser.parse_args()
     if args.episodes_per_speed <= 0 or args.episode_steps <= 0:
         parser.error("episode counts must be positive")
@@ -209,8 +212,10 @@ def main():
     config = _load_config(args.model)
     if config.get("observation_type") != "kinematic_sonar_path_v1":
         parser.error("model is not a kinematic_sonar_path_v1 policy")
+    device = resolve_device(args.device)
+    configure_torch(device)
     env = _make_env(config, args.episode_steps)
-    model = PPO.load(str(args.model), device="cpu")
+    model = PPO.load(str(args.model), device=str(device))
     if model.observation_space != env.observation_space:
         raise ValueError("model observation space differs from environment")
     args.output.mkdir(parents=True, exist_ok=True)

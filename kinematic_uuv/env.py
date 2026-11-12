@@ -33,7 +33,7 @@ class KinematicUUVEnv(gym.Env):
         max_pitch=0.35,
         goal_distance_range=(120.0, 450.0),
         obstacle_count_range=(2, 4),
-        goal_radius=12.0,
+        goal_radius=5.0,
         planning_bounds=((-100.0, -350.0, 0.0),
                          (700.0, 350.0, 100.0)),
         dijkstra_resolution=8.0,
@@ -166,6 +166,7 @@ class KinematicUUVEnv(gym.Env):
                 resolution=self.dijkstra_resolution,
                 obstacle_margin=15.0,
                 goal_radius=self.goal_radius,
+                planner_goal_radius=0.0,
                 planning_bounds=self.planning_bounds,
                 vertical_cost_scale=self.vertical_cost_scale,
             )

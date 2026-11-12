@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .venv/
 .cache/
+*.egg-info/
 runs/
 *.zip
 *.pkl
@@ -9,4 +10,3 @@ runs/
 *.png
 *.json
 *.npz
-

@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export VK_DRIVER_FILES="/home/lu/code/REMUS100_HoloOcean/vendor/radeon_icd.json"
 export MPLCONFIGDIR="$project_dir/.cache/matplotlib"
 mkdir -p "$MPLCONFIGDIR"
 cd "$project_dir"
-exec /home/lu/code/REMUS100_HoloOcean/.venv/bin/python -m training.replay_holoocean "$@"
+python_bin="${PYTHON_BIN:-$project_dir/.venv/bin/python}"
+if [[ ! -x "$python_bin" ]]; then
+    echo "Python environment not found: $python_bin" >&2
+    echo "HoloOcean replay uses the same .venv; install HoloOcean into it." >&2
+    exit 1
+fi
+exec "$python_bin" -m training.replay_holoocean "$@"

@@ -51,7 +51,7 @@ def main():
     rotations = data["roll_pitch_yaw"]
     obstacles = data["obstacles"]
     goal = data["goal"]
-    goal_radius = float(data["goal_radius_m"]) if "goal_radius_m" in data else 12.0
+    goal_radius = float(data["goal_radius_m"]) if "goal_radius_m" in data else 5.0
     speed = data["speed"]
     success = bool(data["success"])
     speed_knots = float(data["target_speed_knots"])

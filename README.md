@@ -10,6 +10,19 @@
 训练和主评估均使用运动学模型。HoloOcean 仅用于独立场景回放、碰撞几何检查和
 可视化，不作为高速动力学验证平台。
 
+## 运行环境
+
+训练和策略评估使用 CUDA GPU。当前锁定环境为 Python 3.10、PyTorch 2.5.1
+CUDA 12.4、Stable-Baselines3 2.7.0。首次部署时运行：
+
+```bash
+cd /path/to/HighSpeedUUV_Kinematic
+./scripts/setup_env.sh
+```
+
+脚本会在项目目录创建 `.venv`，安装依赖，并验证 CUDA 与 GPU。若系统缺少
+`python3-venv`，请先安装 `python3.10-venv` 或提供可用的 `virtualenv`。
+
 ## 运动学模型
 
 状态：
@@ -57,9 +70,13 @@ motion : 当前速度、巡航速度、速度上下限、偏航率、俯仰、�
 6. 保留成功率最高的 checkpoint。
 
 ```bash
-cd /home/lu/code/HighSpeedUUV_Kinematic
+cd /path/to/HighSpeedUUV_Kinematic
 ./scripts/train.sh --timesteps 500000 --output runs/kinematic_ppo --overwrite
 ```
+
+训练默认使用 `cuda`、64 路并行采样和 A100 的 TF32 加速。可通过
+`--device cuda:0`、`--num-envs 8` 和 `--torch-threads 1` 调整。模型、行为克隆、
+策略评估和 PPO 更新均在 GPU 上执行；运动学仿真环境仍由 CPU 并行运行。
 
 训练输出：
 
@@ -79,6 +96,9 @@ cd /home/lu/code/HighSpeedUUV_Kinematic
   --output runs/kinematic_eval
 ```
 
+策略评估默认使用 `--device cuda`；如需显式指定 GPU，可传入
+`--device cuda:0`。
+
 输出：
 
 - `evaluation_metrics.csv`：逐回合结果
@@ -96,6 +116,9 @@ cd /home/lu/code/HighSpeedUUV_Kinematic
 - 最大偏航角速度
 - 最小障碍物距离
 - 最大俯仰角
+
+默认任务成功球半径为 5 m。Dijkstra 规划路径始终以目标球心为终点，
+不会再把整个成功球内部都当成零代价区域。
 
 ## HoloOcean 几何验证
 
@@ -137,17 +160,17 @@ cd /home/lu/code/HighSpeedUUV_Kinematic
 默认参数下（最大横向加速度 6 m/s²、最小转弯半径 20 m）的结果：
 
 | 目标速度 | 0–90% 加速时间 | 满舵转弯半径 | 制动时间 | 制动距离 |
-|---:|---:|---:|---:|---:|
-| 10 节 | 1.50 s | 20.3 m | 1.4 s | 4.1 m |
-| 20 节 | 3.40 s | 20.9 m | 3.1 s | 16.9 m |
-| 30 节 | 5.20 s | 40.9 m | 4.8 s | 37.9 m |
-| 40 节 | 7.10 s | 72.0 m | 6.4 s | 67.2 m |
-| 50 节 | 8.90 s | 111.9 m | 8.1 s | 104.9 m |
+| -------: | --------------: | -----------: | -------: | -------: |
+|    10 节 |          1.50 s |       20.3 m |    1.4 s |    4.1 m |
+|    20 节 |          3.40 s |       20.9 m |    3.1 s |   16.9 m |
+|    30 节 |          5.20 s |       40.9 m |    4.8 s |   37.9 m |
+|    40 节 |          7.10 s |       72.0 m |    6.4 s |   67.2 m |
+|    50 节 |          8.90 s |      111.9 m |    8.1 s |  104.9 m |
 
 这些指标直接验证运动学约束，不涉及 RPM、推力、空化或轴功率。
 
 ## 测试
 
 ```bash
-/home/lu/code/REMUS100_HoloOcean/.venv/bin/python -B -m unittest discover -s tests -v
+./scripts/test.sh
 ```

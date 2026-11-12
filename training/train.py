@@ -2,6 +2,7 @@
 import argparse
 import json
 import math
+import os
 import shutil
 from pathlib import Path
 
@@ -11,10 +12,11 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
 from kinematic_uuv.env import KNOT_MPS, KinematicUUVEnv
 from kinematic_uuv.policy import BoundedActorCriticPolicy, SonarCNNFeaturesExtractor
+from kinematic_uuv.runtime import configure_torch, resolve_device
 from kinematic_uuv.teacher import teacher_action
 
 
@@ -26,13 +28,15 @@ def knots(values):
     return tuple(float(value) * KNOT_MPS for value in values)
 
 
-def _base_envs(training_env):
-    vec_env = training_env.venv if isinstance(training_env, VecNormalize) else training_env
-    return [env.unwrapped for env in vec_env.envs]
-
-
 def _environment(cruise_speed_range, **kwargs):
     return KinematicUUVEnv(cruise_speed_range=cruise_speed_range, **kwargs)
+
+
+def _monitored_environment(cruise_speed_range, episode_steps, monitor_path):
+    return Monitor(
+        _environment(cruise_speed_range, max_steps=episode_steps),
+        filename=monitor_path,
+    )
 
 
 def _stack_observations(observations):
@@ -102,11 +106,12 @@ def _evaluate(model, eval_env, episodes, seed, speeds_knots):
 
 def behavior_clone(model, env, steps, chunk_size, epochs, learning_rate, seed):
     optimizer = torch.optim.Adam(model.policy.parameters(), lr=learning_rate)
+    policy_device = next(model.policy.parameters()).device
     observation, _ = env.reset(seed=seed)
     observations = []
     actions = []
     last_loss = float("nan")
-    action_weights = torch.tensor([1.0, 2.0, 1.0])
+    action_weights = torch.tensor([1.0, 2.0, 1.0], device=policy_device)
     try:
         for collected in range(1, steps + 1):
             action = teacher_action(observation)
@@ -121,13 +126,18 @@ def behavior_clone(model, env, steps, chunk_size, epochs, learning_rate, seed):
         env.close()
 
     data = _stack_observations(observations)
-    targets = torch.as_tensor(np.stack(actions), dtype=torch.float32)
+    targets = torch.as_tensor(
+        np.stack(actions), dtype=torch.float32, device=policy_device
+    )
     model.policy.set_training_mode(True)
     for epoch in range(epochs):
         permutation = torch.randperm(steps)
         for start in range(0, steps, chunk_size):
             indices = permutation[start:start + chunk_size]
-            shuffled = {key: value[indices] for key, value in data.items()}
+            shuffled = {
+                key: value[indices].to(policy_device)
+                for key, value in data.items()
+            }
             mean = model.policy.get_distribution(shuffled).distribution.mean
             prediction = torch.tanh(mean)
             loss = torch.mean(
@@ -166,8 +176,7 @@ class SpeedCurriculumCallback(BaseCallback):
         stage, speed_range = self._stage(progress)
         if stage == self.last_stage:
             return True
-        for env in _base_envs(self.training_env):
-            env.set_cruise_speed_range(speed_range)
+        self.training_env.env_method("set_cruise_speed_range", speed_range)
         self.last_stage = stage
         self.logger.record("curriculum/speed_stage", stage)
         self.logger.record("curriculum/speed_min_knots", speed_range[0] / KNOT_MPS)
@@ -229,8 +238,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timesteps", type=int, default=500_000)
     parser.add_argument("--episode-steps", type=int, default=800)
-    parser.add_argument("--n-steps", type=int, default=1024)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument(
+        "--n-steps", type=int, default=None,
+        help="rollout steps per worker; default targets 4096 total steps",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=None,
+        help="PPO minibatch size; default is 1024 when the rollout permits it",
+    )
+    parser.add_argument("--num-envs", type=int,
+                        default=min(64, max(1, (os.cpu_count() or 2) // 2)))
+    parser.add_argument("--device", default="cuda",
+                        help="PyTorch device: cuda, cuda:0, cpu, or auto")
+    parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--n-epochs", type=int, default=10)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--bc-finetune-learning-rate", type=float, default=1e-4)
@@ -255,12 +275,21 @@ def main():
                         default=Path("runs/kinematic_ppo"))
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
+    if args.n_steps is None:
+        args.n_steps = max(1, 4096 // args.num_envs)
+    if args.batch_size is None:
+        rollout_steps = args.num_envs * args.n_steps
+        args.batch_size = next(
+            size for size in (1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
+            if rollout_steps % size == 0
+        )
     if min(args.timesteps, args.episode_steps, args.n_steps,
-           args.batch_size, args.bc_chunk_size, args.bc_epochs,
+           args.batch_size, args.num_envs, args.bc_chunk_size, args.bc_epochs,
            args.eval_freq, args.eval_episodes) <= 0:
         parser.error("step counts and evaluation parameters must be positive")
-    if args.n_steps % args.batch_size:
-        parser.error("batch-size must divide n-steps")
+    rollout_steps = args.num_envs * args.n_steps
+    if rollout_steps % args.batch_size:
+        parser.error("batch-size must divide num-envs * n-steps")
     if args.bc_steps < 0:
         parser.error("bc-steps must be nonnegative")
 
@@ -276,24 +305,35 @@ def main():
         if stale.exists():
             stale.unlink()
 
-    torch.set_num_threads(2)
+    torch.set_num_threads(max(1, args.torch_threads))
+    device = resolve_device(args.device)
     logger = configure(str(args.output / "logs"), ["stdout", "csv"])
     full_speed_range = knots((5.0, 50.0))
     initial_speed_range = knots((5.0, 20.0)) if args.speed_curriculum else full_speed_range
-    train_raw = DummyVecEnv([lambda: Monitor(
-        _environment(initial_speed_range, max_steps=args.episode_steps),
-        filename=str(args.output / "monitor.csv"),
-    )])
+    train_env_fns = [
+        lambda index=index: _monitored_environment(
+            initial_speed_range,
+            args.episode_steps,
+            str(args.output / f"monitor_{index}.csv"),
+        )
+        for index in range(args.num_envs)
+    ]
+    train_raw = (
+        SubprocVecEnv(train_env_fns)
+        if args.num_envs > 1
+        else DummyVecEnv(train_env_fns)
+    )
     env = VecNormalize(train_raw, training=True, norm_obs=False,
                        norm_reward=True, gamma=args.gamma, clip_reward=10.0)
     eval_raw = DummyVecEnv([lambda: _environment(
         full_speed_range, max_steps=args.episode_steps
     )])
-    base_env = env.venv.envs[0].unwrapped
+    base_env = env.get_attr("unwrapped")[0]
+    configure_torch(device)
     try:
         model = PPO(
             BoundedActorCriticPolicy, env,
-            seed=args.seed, device="cpu", verbose=1,
+            seed=args.seed, device=str(device), verbose=1,
             learning_rate=args.learning_rate,
             n_steps=args.n_steps, batch_size=args.batch_size,
             n_epochs=args.n_epochs, gae_lambda=args.gae_lambda,
@@ -364,6 +404,7 @@ def main():
             "observation_type": OBSERVATION_TYPE,
             "timesteps": args.timesteps,
             "timesteps_after_run": model.num_timesteps,
+            "num_envs": args.num_envs,
             "selected_checkpoint": selected,
             "best_eval": best,
             "bc_steps": bc_steps_actual,
@@ -392,7 +433,8 @@ def main():
             "path_refresh_steps": base_env.path_refresh_steps,
             "speed_curriculum": args.speed_curriculum,
             "eval_speeds_knots": args.eval_speeds_knots,
-            "device": "cpu",
+            "device": str(device),
+            "torch_threads": args.torch_threads,
         }
         (args.output / "run.json").write_text(
             json.dumps(run, indent=2) + "\n", encoding="utf-8"

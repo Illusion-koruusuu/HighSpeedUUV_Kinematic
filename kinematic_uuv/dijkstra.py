@@ -1,14 +1,20 @@
 """Three-dimensional Dijkstra cost field used for path observations."""
-from heapq import heappop, heappush
-
 import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra
 
 
 def build_cost_field(goal, obstacles, start, resolution=8.0,
                      obstacle_margin=5.0, goal_radius=12.0,
                      planning_bounds=((-100.0, -350.0, 0.0),
                                       (700.0, 350.0, 100.0)),
-                     vertical_cost_scale=2.0):
+                     vertical_cost_scale=2.0,
+                     planner_goal_radius=0.0):
+    """Build reverse distances to one goal cell or an optional goal region.
+
+    The default targets only the grid cell nearest the goal center. A positive
+    ``planner_goal_radius`` reproduces the former spherical goal-region mode.
+    """
     if resolution <= 0.0:
         raise ValueError("resolution must be positive")
     lower = np.asarray(planning_bounds[0], dtype=float)
@@ -29,10 +35,13 @@ def build_cost_field(goal, obstacles, start, resolution=8.0,
                       + (grid_y - center[1]) ** 2
                       + (grid_z - center[2]) ** 2 <= inflated ** 2)
 
-    goal_grid = ((grid_x - goal[0]) ** 2
-                 + (grid_y - goal[1]) ** 2
-                 + (grid_z - goal[2]) ** 2 <= goal_radius ** 2)
-    goal_grid &= ~occupancy
+    if planner_goal_radius > 0.0:
+        goal_grid = ((grid_x - goal[0]) ** 2
+                     + (grid_y - goal[1]) ** 2
+                     + (grid_z - goal[2]) ** 2 <= planner_goal_radius ** 2)
+        goal_grid &= ~occupancy
+    else:
+        goal_grid = np.zeros(shape, dtype=bool)
     if not goal_grid.any():
         index = tuple(np.clip(
             np.rint((goal - lower) / resolution).astype(int),
@@ -41,36 +50,65 @@ def build_cost_field(goal, obstacles, start, resolution=8.0,
         goal_grid[index] = True
         occupancy[index] = False
 
-    costs = np.full(shape, np.inf, dtype=np.float32)
-    queue = []
-    for index in zip(*np.nonzero(goal_grid)):
-        costs[index] = 0.0
-        heappush(queue, (0.0, index))
-    neighbors = []
+    free_mask = ~occupancy
+    free_indices = np.flatnonzero(free_mask)
+    node_map = np.full(occupancy.size, -1, dtype=np.int32)
+    node_map[free_indices] = np.arange(free_indices.size, dtype=np.int32)
+    coordinates = np.stack(np.unravel_index(free_indices, shape), axis=1)
+    strides = np.array([
+        shape[1] * shape[2],
+        shape[2],
+        1,
+    ], dtype=np.int64)
+    flat_indices = coordinates @ strides
+    shape_array = np.asarray(shape)
+
+    edge_sources = []
+    edge_targets = []
+    edge_weights = []
     for dx in (-1, 0, 1):
         for dy in (-1, 0, 1):
             for dz in (-1, 0, 1):
-                if dx == dy == dz == 0:
+                if (dx, dy, dz) <= (0, 0, 0):
                     continue
                 length = np.linalg.norm((dx, dy, vertical_cost_scale * dz))
-                neighbors.append(((dx, dy, dz), resolution * float(length)))
+                neighbor_coordinates = coordinates + (dx, dy, dz)
+                inside = np.all(
+                    (neighbor_coordinates >= 0)
+                    & (neighbor_coordinates < shape_array),
+                    axis=1,
+                )
+                neighbor_flat = flat_indices + int(
+                    np.dot((dx, dy, dz), strides)
+                )
+                neighbor_nodes = np.full(free_indices.size, -1, dtype=np.int32)
+                neighbor_nodes[inside] = node_map[neighbor_flat[inside]]
+                connected = neighbor_nodes >= 0
+                sources = np.flatnonzero(connected)
+                edge_sources.append(sources)
+                edge_targets.append(neighbor_nodes[connected])
+                edge_weights.append(np.full(
+                    sources.size, resolution * float(length), dtype=np.float32
+                ))
 
-    while queue:
-        current_cost, current = heappop(queue)
-        if current_cost > float(costs[current]) + 1e-5:
-            continue
-        for (dx, dy, dz), edge_cost in neighbors:
-            neighbor = (current[0] + dx, current[1] + dy, current[2] + dz)
-            if not (0 <= neighbor[0] < shape[0]
-                    and 0 <= neighbor[1] < shape[1]
-                    and 0 <= neighbor[2] < shape[2]):
-                continue
-            if occupancy[neighbor]:
-                continue
-            candidate = current_cost + edge_cost
-            if candidate < costs[neighbor]:
-                costs[neighbor] = candidate
-                heappush(queue, (candidate, neighbor))
+    graph = csr_matrix(
+        (
+            np.concatenate(edge_weights),
+            (np.concatenate(edge_sources), np.concatenate(edge_targets)),
+        ),
+        shape=(free_indices.size, free_indices.size),
+    )
+    goal_nodes = node_map[np.flatnonzero(goal_grid)]
+    goal_nodes = goal_nodes[goal_nodes >= 0]
+    costs = np.full(shape, np.inf, dtype=np.float32)
+    if goal_nodes.size:
+        distances = dijkstra(
+            graph,
+            directed=False,
+            indices=goal_nodes,
+            min_only=True,
+        )
+        costs.ravel()[free_indices] = distances.astype(np.float32)
     return costs, lower, float(resolution), occupancy
 
 
@@ -97,4 +135,3 @@ def interpolate_cost(costs, origin, resolution, position):
                     value += weight * cost
                     weight_sum += weight
     return value / weight_sum if weight_sum > 0.0 else float("inf")
-
