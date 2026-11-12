@@ -62,12 +62,12 @@ motion : 当前速度、巡航速度、速度上下限、偏航率、俯仰、�
 
 默认流程：
 
-1. 路径跟随教师采集 5,000 步动作；
-2. 行为克隆 100 个 epoch，初始化神经网络；
-3. BC 模型先做 10 回合多速度评估；
-4. 低学习率 PPO 微调；
-5. 每 25k 步在 10/20/30/40/50 节上评估；
-6. 保留成功率最高的 checkpoint。
+1. 从不同场景采集 100,000 步成功教师轨迹，训练集和验证集使用互斥种子；
+2. 行为克隆最多 20 个 epoch，按验证集和闭环成功率早停；
+3. BC 默认在 10/20/30/40/50 节各评估 20 回合；
+4. BC 成功率低于 85% 时默认停止，不启动 PPO；
+5. 使用 `1e-4` 学习率 PPO 微调，并保留 BC 初始化作为兜底；
+6. 每 25k 步在每档速度各评估 5 回合，保留成功率最高的 checkpoint。
 
 ```bash
 cd /path/to/HighSpeedUUV_Kinematic
@@ -77,6 +77,9 @@ cd /path/to/HighSpeedUUV_Kinematic
 训练默认使用 `cuda`、64 路并行采样和 A100 的 TF32 加速。可通过
 `--device cuda:0`、`--num-envs 8` 和 `--torch-threads 1` 调整。模型、行为克隆、
 策略评估和 PPO 更新均在 GPU 上执行；运动学仿真环境仍由 CPU 并行运行。
+
+BC 数据量可通过 `--bc-steps` 和 `--bc-val-steps` 调整。成功率门槛可通过
+`--bc-min-success-rate` 修改；仅调试流程时可使用 `--allow-low-bc` 跳过门槛。
 
 训练输出：
 
@@ -88,11 +91,11 @@ cd /path/to/HighSpeedUUV_Kinematic
 
 ## 评估
 
-默认分别在 10、20、30、40、50 节各运行 10 回合：
+默认分别在 10、20、30、40、50 节各运行 20 回合：
 
 ```bash
 ./scripts/evaluate.sh runs/kinematic_ppo/ppo_kinematic.zip \
-  --episodes-per-speed 10 --seed 0 \
+  --episodes-per-speed 20 --seed 0 \
   --output runs/kinematic_eval
 ```
 
@@ -119,6 +122,55 @@ cd /path/to/HighSpeedUUV_Kinematic
 
 默认任务成功球半径为 5 m。Dijkstra 规划路径始终以目标球心为终点，
 不会再把整个成功球内部都当成零代价区域。
+
+## 轨迹可视化验证
+
+策略评估会生成 `trajectories/*.npz`。可视化程序会为每条轨迹生成一张
+诊断图，包含三维轨迹、障碍物、目标球、速度跟踪、俯仰/偏航、目标距离和
+障碍物净距：
+
+```bash
+./scripts/evaluate.sh runs/fix_bc_100k/bc_model.zip \
+  --episodes-per-speed 5 --seed 1000 \
+  --output runs/kinematic_viz_eval
+
+./scripts/visualize.sh runs/kinematic_viz_eval \
+  --output runs/kinematic_visualization \
+  --speeds-knots 10 20 30 40 50 \
+  --max-trajectories 10
+```
+
+也可以只可视化一个轨迹：
+
+```bash
+./scripts/visualize.sh \
+  runs/kinematic_viz_eval/trajectories/speed20_seed1000.npz
+```
+
+输出包括 `*_diagnostics.png` 和 `visualization_summary.json`。后者记录成功率、
+最终目标距离、最小障碍物净距、最大俯仰角、最大偏航角速度和最大横向加速度。
+
+## 实时播放单条轨迹
+
+有桌面的服务器上，可以直接实时播放 AUV 位置、航向箭头、尾迹、速度和姿态：
+
+```bash
+./scripts/play.sh \
+  runs/kinematic_viz_eval/trajectories/speed20_seed1000.npz \
+  --backend TkAgg --speed 1.0
+```
+
+无桌面或远程服务器可导出 MP4/GIF：
+
+```bash
+./scripts/play.sh \
+  runs/kinematic_viz_eval/trajectories/speed20_seed1000.npz \
+  --save runs/kinematic_viz_eval/speed20_playback.mp4
+```
+
+`--speed 0.5` 为半速播放，`--speed 2` 为二倍速；`--trail-seconds 8` 控制
+尾迹时长，`--stride 2` 表示每两帧播放一帧。交互窗口会播放一次，可用
+`--repeat` 循环。
 
 ## HoloOcean 几何验证
 

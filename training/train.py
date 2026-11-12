@@ -17,7 +17,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNorm
 from kinematic_uuv.env import KNOT_MPS, KinematicUUVEnv
 from kinematic_uuv.policy import BoundedActorCriticPolicy, SonarCNNFeaturesExtractor
 from kinematic_uuv.runtime import configure_torch, resolve_device
-from kinematic_uuv.teacher import teacher_action
+from training.teacher_data import collect_teacher_dataset
 
 
 ACTION_DISTRIBUTION = "squashed_diag_gaussian"
@@ -42,10 +42,10 @@ def _monitored_environment(cruise_speed_range, episode_steps, monitor_path):
 def _stack_observations(observations):
     return {
         key: torch.as_tensor(
-            np.stack([observation[key] for observation in observations]),
+            observations[key],
             dtype=torch.float32,
         )
-        for key in observations[0]
+        for key in observations
     }
 
 
@@ -61,38 +61,41 @@ def _evaluate(model, eval_env, episodes, seed, speeds_knots):
     vec_env = eval_env.venv if isinstance(eval_env, VecNormalize) else eval_env
     base_env = vec_env.envs[0].unwrapped
     rows = []
-    for episode in range(episodes):
-        base_env.cruise_speed_override = float(speeds_knots[episode % len(speeds_knots)]) * KNOT_MPS
-        eval_env.seed(seed + episode)
-        observation = eval_env.reset()
-        steps = 0
-        info = {}
-        while True:
-            action, _ = model.predict(observation, deterministic=True)
-            observation, _, dones, infos = eval_env.step(action)
-            steps += 1
-            if bool(dones[0]):
-                info = infos[0]
-                break
-        rows.append({
-            "episode": episode,
-            "seed": seed + episode,
-            "target_speed_knots": float(speeds_knots[episode % len(speeds_knots)]),
-            "success": int(bool(info.get("reached", False))),
-            "collision": int(bool(info.get("collision", False))),
-            "out_of_bounds": int(bool(info.get("out_of_bounds", False))),
-            "timeout": int(not info.get("reached", False)
-                           and not info.get("collision", False)
-                           and not info.get("out_of_bounds", False)),
-            "steps": steps,
-            "final_distance_m": float(info.get("distance_to_goal", np.nan)),
-            "mean_speed_mps": float(info.get("speed_mps", np.nan)),
-            "clearance_m": float(info.get("clearance_m", np.nan)),
-        })
+    for speed_index, speed_knots in enumerate(speeds_knots):
+        for episode in range(episodes):
+            base_env.cruise_speed_override = float(speed_knots) * KNOT_MPS
+            episode_seed = seed + episode
+            eval_env.seed(episode_seed)
+            observation = eval_env.reset()
+            steps = 0
+            info = {}
+            while True:
+                action, _ = model.predict(observation, deterministic=True)
+                observation, _, dones, infos = eval_env.step(action)
+                steps += 1
+                if bool(dones[0]):
+                    info = infos[0]
+                    break
+            rows.append({
+                "speed_index": speed_index,
+                "episode": episode,
+                "seed": episode_seed,
+                "target_speed_knots": float(speed_knots),
+                "success": int(bool(info.get("reached", False))),
+                "collision": int(bool(info.get("collision", False))),
+                "out_of_bounds": int(bool(info.get("out_of_bounds", False))),
+                "timeout": int(not info.get("reached", False)
+                               and not info.get("collision", False)
+                               and not info.get("out_of_bounds", False)),
+                "steps": steps,
+                "final_distance_m": float(info.get("distance_to_goal", np.nan)),
+                "mean_speed_mps": float(info.get("speed_mps", np.nan)),
+                "clearance_m": float(info.get("clearance_m", np.nan)),
+            })
     model.policy.set_training_mode(True)
     base_env.cruise_speed_override = None
     return {
-        "episodes": episodes,
+        "episodes_per_speed": episodes,
         "speeds_knots": list(speeds_knots),
         "success_rate": float(np.mean([row["success"] for row in rows])),
         "collision_rate": float(np.mean([row["collision"] for row in rows])),
@@ -104,39 +107,63 @@ def _evaluate(model, eval_env, episodes, seed, speeds_knots):
     }
 
 
-def behavior_clone(model, env, steps, chunk_size, epochs, learning_rate, seed):
-    optimizer = torch.optim.Adam(model.policy.parameters(), lr=learning_rate)
+def _policy_action_mse(model, dataset, batch_size):
     policy_device = next(model.policy.parameters()).device
-    observation, _ = env.reset(seed=seed)
-    observations = []
-    actions = []
-    last_loss = float("nan")
-    action_weights = torch.tensor([1.0, 2.0, 1.0], device=policy_device)
-    try:
-        for collected in range(1, steps + 1):
-            action = teacher_action(observation)
-            observations.append(observation)
-            actions.append(action)
-            observation, _, terminated, truncated, _ = env.step(action)
-            if terminated or truncated:
-                observation, _ = env.reset()
-            if collected % chunk_size == 0 or collected == steps:
-                print(f"BC data collection: {collected}/{steps}", flush=True)
-    finally:
-        env.close()
+    action_weights = torch.tensor([1.0, 2.0, 4.0], device=policy_device)
+    targets = torch.as_tensor(dataset["actions"], device=policy_device)
+    losses = []
+    model.policy.set_training_mode(False)
+    with torch.no_grad():
+        for start in range(0, len(targets), batch_size):
+            stop = min(start + batch_size, len(targets))
+            batch = {
+                key: torch.as_tensor(
+                    dataset["observations"][key][start:stop],
+                    dtype=torch.float32,
+                    device=policy_device,
+                )
+                for key in dataset["observations"]
+            }
+            mean = model.policy.get_distribution(batch).distribution.mean
+            prediction = torch.tanh(mean)
+            losses.append(float(torch.mean(
+                action_weights * (prediction - targets[start:stop]) ** 2
+            )))
+    return float(np.mean(losses))
 
-    data = _stack_observations(observations)
-    targets = torch.as_tensor(
-        np.stack(actions), dtype=torch.float32, device=policy_device
+
+def behavior_clone(model, train_data, val_data, chunk_size, epochs,
+                   learning_rate, seed, eval_env, eval_speeds_knots,
+                   eval_episodes, eval_interval, patience):
+    optimizer = torch.optim.AdamW(
+        model.policy.parameters(), lr=learning_rate, weight_decay=1e-4
     )
+    policy_device = next(model.policy.parameters()).device
+    steps = len(train_data["actions"])
+    targets = torch.as_tensor(
+        train_data["actions"], dtype=torch.float32, device=policy_device
+    )
+    action_weights = torch.tensor([1.0, 2.0, 4.0], device=policy_device)
+    random = np.random.default_rng(seed)
+    best_key = None
+    best_state = None
+    best_epoch = 0
+    best_val_mse = float("inf")
+    evaluations_without_improvement = 0
+    last_success = 0.0
     model.policy.set_training_mode(True)
     for epoch in range(epochs):
-        permutation = torch.randperm(steps)
+        permutation = random.permutation(steps)
+        train_losses = []
         for start in range(0, steps, chunk_size):
             indices = permutation[start:start + chunk_size]
             shuffled = {
-                key: value[indices].to(policy_device)
-                for key, value in data.items()
+                key: torch.as_tensor(
+                    train_data["observations"][key][indices],
+                    dtype=torch.float32,
+                    device=policy_device,
+                )
+                for key in train_data["observations"]
             }
             mean = model.policy.get_distribution(shuffled).distribution.mean
             prediction = torch.tanh(mean)
@@ -147,11 +174,46 @@ def behavior_clone(model, env, steps, chunk_size, epochs, learning_rate, seed):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.policy.parameters(), 1.0)
             optimizer.step()
-            last_loss = float(loss.detach())
-        if epoch == 0 or (epoch + 1) % 10 == 0 or epoch + 1 == epochs:
-            print(f"BC epoch {epoch + 1}/{epochs}, action MSE={last_loss:.6f}",
-                  flush=True)
-    return steps, last_loss
+            train_losses.append(float(loss.detach()))
+
+        val_mse = _policy_action_mse(model, val_data, chunk_size)
+        if (epoch + 1) % eval_interval == 0 or epoch + 1 == epochs:
+            evaluation = _evaluate(
+                model, eval_env, eval_episodes, seed, eval_speeds_knots
+            )
+            last_success = evaluation["success_rate"]
+        key = (last_success, -val_mse)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_epoch = epoch + 1
+            best_val_mse = val_mse
+            best_state = {
+                name: value.detach().cpu().clone()
+                for name, value in model.policy.state_dict().items()
+            }
+            evaluations_without_improvement = 0
+        elif (epoch + 1) % eval_interval == 0:
+            evaluations_without_improvement += 1
+        print(
+            f"BC epoch {epoch + 1}/{epochs}: "
+            f"train MSE={np.mean(train_losses):.6f}, "
+            f"val MSE={val_mse:.6f}, success={last_success:.0%}",
+            flush=True,
+        )
+        if evaluations_without_improvement >= patience:
+            print(f"BC early stopping at epoch {epoch + 1}", flush=True)
+            break
+
+    if best_state is not None:
+        model.policy.load_state_dict(best_state)
+    model.policy.set_training_mode(True)
+    return {
+        "steps": steps,
+        "epochs_completed": epoch + 1,
+        "best_epoch": best_epoch,
+        "train_action_mse": float(np.mean(train_losses)),
+        "validation_action_mse": best_val_mse,
+    }
 
 
 class SpeedCurriculumCallback(BaseCallback):
@@ -260,12 +322,22 @@ def main():
     parser.add_argument("--gae-lambda", type=float, default=0.995)
     parser.add_argument("--target-kl", type=float, default=0.03)
     parser.add_argument("--initial-speed-action", type=float, default=0.2)
-    parser.add_argument("--bc-steps", type=int, default=5_000)
-    parser.add_argument("--bc-chunk-size", type=int, default=1_000)
-    parser.add_argument("--bc-epochs", type=int, default=100)
-    parser.add_argument("--bc-learning-rate", type=float, default=1e-3)
+    parser.add_argument("--bc-steps", type=int, default=100_000)
+    parser.add_argument("--bc-val-steps", type=int, default=15_000)
+    parser.add_argument(
+        "--bc-workers", type=int,
+        default=min(32, max(1, (os.cpu_count() or 2) // 4)),
+    )
+    parser.add_argument("--bc-chunk-size", type=int, default=2_048)
+    parser.add_argument("--bc-epochs", type=int, default=20)
+    parser.add_argument("--bc-learning-rate", type=float, default=3e-4)
+    parser.add_argument("--bc-eval-interval", type=int, default=5)
+    parser.add_argument("--bc-eval-episodes", type=int, default=20)
+    parser.add_argument("--bc-patience", type=int, default=2)
+    parser.add_argument("--bc-min-success-rate", type=float, default=0.85)
+    parser.add_argument("--allow-low-bc", action="store_true")
     parser.add_argument("--eval-freq", type=int, default=25_000)
-    parser.add_argument("--eval-episodes", type=int, default=10)
+    parser.add_argument("--eval-episodes", type=int, default=5)
     parser.add_argument("--eval-speeds-knots", type=float, nargs="+",
                         default=[10.0, 20.0, 30.0, 40.0, 50.0])
     parser.add_argument("--speed-curriculum", action=argparse.BooleanOptionalAction,
@@ -292,6 +364,13 @@ def main():
         parser.error("batch-size must divide num-envs * n-steps")
     if args.bc_steps < 0:
         parser.error("bc-steps must be nonnegative")
+    if args.bc_steps > 0 and min(
+        args.bc_val_steps, args.bc_workers, args.bc_eval_interval,
+        args.bc_eval_episodes, args.bc_patience,
+    ) <= 0:
+        parser.error("BC validation and collection parameters must be positive")
+    if not 0.0 <= args.bc_min_success_rate <= 1.0:
+        parser.error("bc-min-success-rate must be between 0 and 1")
 
     args.output.mkdir(parents=True, exist_ok=True)
     model_path = args.output / "ppo_kinematic.zip"
@@ -352,23 +431,77 @@ def main():
         bc_steps_actual = 0
         bc_loss = None
         bc_eval = None
+        bc_info = None
+        bc_data_stats = None
         if args.bc_steps > 0:
-            bc_env = _environment(full_speed_range, max_steps=args.episode_steps)
-            bc_steps_actual, bc_loss = behavior_clone(
-                model, bc_env, args.bc_steps, args.bc_chunk_size,
-                args.bc_epochs, args.bc_learning_rate, args.seed,
+            train_data = collect_teacher_dataset(
+                args.bc_steps,
+                seed_start=10_000 + args.seed * 1_000_000,
+                speeds_knots=args.eval_speeds_knots,
+                episode_steps=args.episode_steps,
+                workers=args.bc_workers,
             )
+            val_data = collect_teacher_dataset(
+                args.bc_val_steps,
+                seed_start=100_000_000 + args.seed * 1_000_000,
+                speeds_knots=args.eval_speeds_knots,
+                episode_steps=args.episode_steps,
+                workers=args.bc_workers,
+            )
+            bc_data_stats = {
+                "train": {key: value for key, value in train_data.items()
+                          if key not in {"observations", "actions"}},
+                "validation": {key: value for key, value in val_data.items()
+                               if key not in {"observations", "actions"}},
+            }
+            (args.output / "bc_data_stats.json").write_text(
+                json.dumps(bc_data_stats, indent=2) + "\n", encoding="utf-8"
+            )
+            bc_info = behavior_clone(
+                model, train_data, val_data, args.bc_chunk_size,
+                args.bc_epochs, args.bc_learning_rate, args.seed,
+                eval_raw, args.eval_speeds_knots, args.bc_eval_episodes,
+                args.bc_eval_interval, args.bc_patience,
+            )
+            bc_steps_actual = bc_info["steps"]
+            bc_loss = bc_info["validation_action_mse"]
             model.save(str((args.output / "bc_model").with_suffix("")))
-            bc_eval = _evaluate(model, eval_raw, args.eval_episodes, args.seed,
-                                args.eval_speeds_knots)
+            bc_eval = _evaluate(
+                model, eval_raw, args.bc_eval_episodes, args.seed,
+                args.eval_speeds_knots,
+            )
             bc_eval["timestep"] = 0
             print(f"BC evaluation: success={bc_eval['success_rate']:.0%}", flush=True)
+            if (bc_eval["success_rate"] < args.bc_min_success_rate
+                    and not args.allow_low_bc):
+                shutil.copyfile(
+                    args.output / "bc_model.zip",
+                    model_path,
+                )
+                gate = {
+                    "required_success_rate": args.bc_min_success_rate,
+                    "bc_eval": bc_eval,
+                    "bc_info": bc_info,
+                    "bc_data_stats": bc_data_stats,
+                }
+                (args.output / "bc_gate_failure.json").write_text(
+                    json.dumps(gate, indent=2) + "\n", encoding="utf-8"
+                )
+                print(
+                    "BC gate failed: "
+                    f"{bc_eval['success_rate']:.0%} < "
+                    f"{args.bc_min_success_rate:.0%}; PPO was not started. "
+                    "Use --allow-low-bc to override.",
+                    flush=True,
+                )
+                return
             if bc_eval["success_rate"] > 0.0:
                 model.save(str(best_model_path.with_suffix("")))
                 best_info_path.write_text(
                     json.dumps(bc_eval, indent=2) + "\n", encoding="utf-8"
                 )
             model.learning_rate = args.bc_finetune_learning_rate
+            model._setup_lr_schedule()
             for group in model.policy.optimizer.param_groups:
                 group["lr"] = args.bc_finetune_learning_rate
 
@@ -405,11 +538,17 @@ def main():
             "timesteps": args.timesteps,
             "timesteps_after_run": model.num_timesteps,
             "num_envs": args.num_envs,
+            "n_steps": args.n_steps,
+            "batch_size": args.batch_size,
+            "learning_rate": args.learning_rate,
+            "bc_finetune_learning_rate": args.bc_finetune_learning_rate,
             "selected_checkpoint": selected,
             "best_eval": best,
             "bc_steps": bc_steps_actual,
             "bc_final_action_mse": bc_loss,
             "bc_eval": bc_eval,
+            "bc_info": bc_info,
+            "bc_data_stats": bc_data_stats,
             "episode_steps": args.episode_steps,
             "dt": base_env.dt,
             "speed_min_mps": base_env.speed_min,
@@ -433,6 +572,7 @@ def main():
             "path_refresh_steps": base_env.path_refresh_steps,
             "speed_curriculum": args.speed_curriculum,
             "eval_speeds_knots": args.eval_speeds_knots,
+            "eval_episodes_per_speed": args.eval_episodes,
             "device": str(device),
             "torch_threads": args.torch_threads,
         }

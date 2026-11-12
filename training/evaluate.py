@@ -65,6 +65,7 @@ def _save_trajectory(path, record):
         success=np.asarray(record["success"]),
         seed=np.asarray(record["seed"]),
         target_speed_knots=np.asarray(record["target_speed_knots"]),
+        dt=np.asarray(record.get("dt", 0.1)),
     )
 
 
@@ -131,6 +132,7 @@ def run_episode(env, model, seed, speed_knots):
         "success": bool(info.get("reached", False)),
         "seed": seed,
         "target_speed_knots": speed_knots,
+        "dt": env.dt,
     }
     return result, trajectory
 
@@ -197,7 +199,7 @@ def main():
     parser.add_argument("model", type=Path)
     parser.add_argument("--output", type=Path, default=Path("runs/kinematic_eval"))
     parser.add_argument("--episode-steps", type=int, default=800)
-    parser.add_argument("--episodes-per-speed", type=int, default=10)
+    parser.add_argument("--episodes-per-speed", type=int, default=20)
     parser.add_argument("--speeds-knots", type=float, nargs="+",
                         default=[10.0, 20.0, 30.0, 40.0, 50.0])
     parser.add_argument("--seed", type=int, default=0)

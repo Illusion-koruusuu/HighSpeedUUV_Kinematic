@@ -434,6 +434,7 @@ class KinematicUUVEnv(gym.Env):
         speed_error = abs(self.state["speed"] - desired_speed) / max(
             self.cruise_speed, 1.0
         )
+        goal_proximity = 1.0 - float(np.clip(distance / 100.0, 0.0, 1.0))
         clearance = min(
             (np.linalg.norm(position - center) - radius
              for center, radius in self.obstacles),
@@ -447,6 +448,7 @@ class KinematicUUVEnv(gym.Env):
             - 0.3 * speed_error
             - 0.2 * safety_penalty
             - 0.02
+            + 2.0 * goal_proximity
         )
         if reached:
             reward += 100.0
@@ -470,6 +472,8 @@ class KinematicUUVEnv(gym.Env):
         }
         terminated = bool(collided or reached or out_of_bounds)
         truncated = bool(self.steps >= self.max_steps)
+        if truncated and not terminated:
+            reward -= 50.0
         self._previous_observation = previous_observation
         return observation, float(reward), terminated, truncated, info
 
