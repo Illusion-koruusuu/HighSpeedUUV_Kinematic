@@ -4,7 +4,7 @@ __pycache__/
 .cache/
 *.egg-info/
 runs/
-*.zip
+# *.zip
 *.pkl
 *.csv
 *.png
