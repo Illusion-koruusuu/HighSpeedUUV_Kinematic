@@ -40,7 +40,13 @@ def _make_env(config, episode_steps):
         max_pitch_rate=config.get("max_pitch_rate_rad_s", 0.20),
         max_pitch=config.get("max_pitch_rad", 0.35),
         goal_radius=config.get("goal_radius_m", 5.0),
-        obstacle_count_range=tuple(config.get("obstacle_count_range", [2, 6])),
+        obstacle_count_range=tuple(config.get("obstacle_count_range", [2, 4])),
+        obstacle_radius_range=tuple(
+            config.get("obstacle_radius_range_m", [4.0, 8.0])
+        ),
+        obstacle_distribution=config.get(
+            "obstacle_distribution", "uniform"
+        ),
         goal_distance_range=tuple(config.get("goal_distance_range_m", [120, 450])),
         dijkstra_resolution=config.get("dijkstra_resolution_m", 8.0),
         path_refresh_steps=config.get("path_refresh_steps", 5),
@@ -197,9 +203,12 @@ def plot_summary(summary, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path)
-    parser.add_argument("--output", type=Path, default=Path("runs/kinematic_eval"))
-    parser.add_argument("--episode-steps", type=int, default=800)
-    parser.add_argument("--episodes-per-speed", type=int, default=20)
+    parser.add_argument(
+        "--output", type=Path,
+        default=Path("output_model/kinematic_eval"),
+    )
+    parser.add_argument("--episode-steps", type=int, default=1000)
+    parser.add_argument("--episodes-per-speed", type=int, default=50)
     parser.add_argument("--speeds-knots", type=float, nargs="+",
                         default=[10.0, 20.0, 30.0, 40.0, 50.0])
     parser.add_argument("--seed", type=int, default=0)
@@ -221,6 +230,8 @@ def main():
     if model.observation_space != env.observation_space:
         raise ValueError("model observation space differs from environment")
     args.output.mkdir(parents=True, exist_ok=True)
+    csv_dir = args.output / "csv"
+    csv_dir.mkdir(parents=True, exist_ok=True)
     trajectory_dir = args.output / "trajectories"
     if args.save_trajectories:
         trajectory_dir.mkdir(parents=True, exist_ok=True)
@@ -246,9 +257,9 @@ def main():
     finally:
         env.close()
 
-    csv_path = args.output / "evaluation_metrics.csv"
+    csv_path = csv_dir / "evaluation_metrics.csv"
     summary = write_metrics(csv_path, rows)
-    write_summary(args.output / "evaluation_summary.csv", summary)
+    write_summary(csv_dir / "evaluation_summary.csv", summary)
     (args.output / "evaluation_summary.json").write_text(
         json.dumps(summary, indent=2) + "\n", encoding="utf-8"
     )

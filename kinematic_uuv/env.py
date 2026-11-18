@@ -32,7 +32,9 @@ class KinematicUUVEnv(gym.Env):
         max_pitch_rate=0.20,
         max_pitch=0.35,
         goal_distance_range=(120.0, 450.0),
-        obstacle_count_range=(2, 4),
+        obstacle_count_range=(20, 32),
+        obstacle_radius_range=(4.0, 22.0),
+        obstacle_distribution="uniform",
         goal_radius=5.0,
         planning_bounds=((-100.0, -350.0, 0.0),
                          (700.0, 350.0, 100.0)),
@@ -59,6 +61,15 @@ class KinematicUUVEnv(gym.Env):
         self.obstacle_count_min, self.obstacle_count_max = map(
             int, obstacle_count_range
         )
+        self.obstacle_radius_min, self.obstacle_radius_max = map(
+            float, obstacle_radius_range
+        )
+        if self.obstacle_radius_min <= 0.0 or (
+                self.obstacle_radius_max < self.obstacle_radius_min):
+            raise ValueError("invalid obstacle radius range")
+        self.obstacle_distribution = str(obstacle_distribution)
+        if self.obstacle_distribution != "uniform":
+            raise ValueError("only uniform obstacle distribution is supported")
         self.goal_radius = float(goal_radius)
         self.planning_bounds = (
             np.asarray(planning_bounds[0], dtype=float),
@@ -137,25 +148,54 @@ class KinematicUUVEnv(gym.Env):
         count = int(self.np_random.integers(
             self.obstacle_count_min, self.obstacle_count_max + 1
         ))
-        self.obstacles = []
-        for obstacle_index in range(count):
-            for _attempt in range(50):
-                fraction = self.np_random.uniform(0.25, 0.80)
-                center = start + fraction * (self.goal - start)
-                center[:2] += self.np_random.normal(0.0, 18.0, size=2)
-                center[2] += self.np_random.normal(0.0, 8.0)
-                center[2] = np.clip(center[2], 5.0, 85.0)
-                radius = float(self.np_random.uniform(4.0, 8.0))
+        for _attempt in range(20):
+            obstacles = self._sample_obstacles(start, count)
+            if len(obstacles) == count:
+                self.obstacles = obstacles
+                return
+        raise RuntimeError("failed to generate a valid obstacle scene")
+
+    def _sample_radius(self):
+        draw = float(self.np_random.random())
+        if draw < 0.45:
+            low, high = self.obstacle_radius_min, min(
+                8.0, self.obstacle_radius_max
+            )
+        elif draw < 0.75:
+            low, high = max(8.0, self.obstacle_radius_min), min(
+                14.0, self.obstacle_radius_max
+            )
+        else:
+            low, high = max(14.0, self.obstacle_radius_min), \
+                self.obstacle_radius_max
+        return float(self.np_random.uniform(low, max(low, high)))
+
+    def _sample_obstacles(self, start, count):
+        lower, upper = self.planning_bounds
+        obstacles = []
+        for _obstacle_index in range(count):
+            placed = False
+            for _attempt in range(600):
+                radius = self._sample_radius()
+                center = self.np_random.uniform(lower + 2.0, upper - 2.0)
                 separated = all(
                     np.linalg.norm(center - other_center)
-                    > radius + other_radius + 18.0
-                    for other_center, other_radius in self.obstacles
+                    > radius + other_radius + 2.0
+                    for other_center, other_radius in obstacles
                 )
-                if (np.linalg.norm(center - start) > radius + 30.0
-                        and np.linalg.norm(center - self.goal) > radius + 25.0
-                        and separated):
-                    self.obstacles.append((center, radius))
+                clears_start = (
+                    np.linalg.norm(center - start) > radius + 26.0
+                )
+                clears_goal = (
+                    np.linalg.norm(center - self.goal) > radius + 22.0
+                )
+                if clears_start and clears_goal and separated:
+                    obstacles.append((center, radius))
+                    placed = True
                     break
+            if not placed:
+                return []
+        return obstacles
 
     def _build_cost_field(self):
         self._cost_field, self._cost_origin, self.dijkstra_resolution, \
@@ -328,8 +368,13 @@ class KinematicUUVEnv(gym.Env):
             "pitch_rate": 0.0,
         }
         self.steps = 0
-        self._sample_scene()
-        self._build_cost_field()
+        for _attempt in range(10):
+            self._sample_scene()
+            self._build_cost_field()
+            if np.isfinite(self._dijkstra_cost(self.state["position"])):
+                break
+        else:
+            raise RuntimeError("failed to generate a reachable obstacle scene")
         self._cached_path = self._plan_path(self.state["position"])
         return self._observe(), {}
 

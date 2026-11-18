@@ -45,7 +45,22 @@ class KinematicEnvTests(unittest.TestCase):
         finally:
             env.close()
 
+    def test_default_scene_has_uniform_dense_obstacles(self):
+        env = KinematicUUVEnv(max_steps=20)
+        try:
+            env.reset(seed=0)
+            obstacles = env.obstacles
+            start = env.state["position"]
+            centers = np.asarray([center for center, _ in obstacles])
+            self.assertGreaterEqual(len(obstacles), 20)
+            self.assertTrue(any(radius >= 14.0 for _, radius in obstacles))
+            self.assertGreater(np.ptp(centers[:, 0]), 250.0)
+            self.assertGreater(np.ptp(centers[:, 1]), 250.0)
+            self.assertGreater(np.ptp(centers[:, 2]), 30.0)
+            self.assertTrue(np.isfinite(env._dijkstra_cost(start)))
+        finally:
+            env.close()
+
 
 if __name__ == "__main__":
     unittest.main()
-

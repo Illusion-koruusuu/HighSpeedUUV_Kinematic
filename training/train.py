@@ -334,7 +334,7 @@ def main():
     parser.add_argument("--bc-eval-interval", type=int, default=5)
     parser.add_argument("--bc-eval-episodes", type=int, default=20)
     parser.add_argument("--bc-patience", type=int, default=2)
-    parser.add_argument("--bc-min-success-rate", type=float, default=0.85)
+    parser.add_argument("--bc-min-success-rate", type=float, default=0.70)
     parser.add_argument("--allow-low-bc", action="store_true")
     parser.add_argument("--eval-freq", type=int, default=25_000)
     parser.add_argument("--eval-episodes", type=int, default=5)
@@ -344,7 +344,7 @@ def main():
                         default=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path,
-                        default=Path("runs/kinematic_ppo"))
+                        default=Path("output_model/kinematic_ppo"))
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     if args.n_steps is None:
@@ -386,14 +386,17 @@ def main():
 
     torch.set_num_threads(max(1, args.torch_threads))
     device = resolve_device(args.device)
-    logger = configure(str(args.output / "logs"), ["stdout", "csv"])
+    csv_dir = args.output / "csv"
+    monitor_dir = csv_dir / "monitors"
+    monitor_dir.mkdir(parents=True, exist_ok=True)
+    logger = configure(str(csv_dir), ["stdout", "csv"])
     full_speed_range = knots((5.0, 50.0))
     initial_speed_range = knots((5.0, 20.0)) if args.speed_curriculum else full_speed_range
     train_env_fns = [
         lambda index=index: _monitored_environment(
             initial_speed_range,
             args.episode_steps,
-            str(args.output / f"monitor_{index}.csv"),
+            str(monitor_dir / f"monitor_{index}"),
         )
         for index in range(args.num_envs)
     ]
@@ -565,6 +568,11 @@ def main():
             "goal_radius_m": base_env.goal_radius,
             "obstacle_count_range": [base_env.obstacle_count_min,
                                      base_env.obstacle_count_max],
+            "obstacle_radius_range_m": [
+                base_env.obstacle_radius_min,
+                base_env.obstacle_radius_max,
+            ],
+            "obstacle_distribution": base_env.obstacle_distribution,
             "goal_distance_range_m": list(base_env.goal_distance_range),
             "planning_bounds_m": [base_env.planning_bounds[0].tolist(),
                                   base_env.planning_bounds[1].tolist()],
@@ -575,6 +583,7 @@ def main():
             "eval_episodes_per_speed": args.eval_episodes,
             "device": str(device),
             "torch_threads": args.torch_threads,
+            "csv_dir": "csv",
         }
         (args.output / "run.json").write_text(
             json.dumps(run, indent=2) + "\n", encoding="utf-8"

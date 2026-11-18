@@ -126,9 +126,11 @@ def main():
     parser.add_argument("--speeds-knots", type=float, nargs="+",
                         default=[10.0, 20.0, 30.0, 40.0, 50.0])
     parser.add_argument("--output", type=Path,
-                        default=Path("runs/kinematic_benchmark"))
+                        default=Path("output_model/kinematic_benchmark"))
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
+    csv_dir = args.output / "csv"
+    csv_dir.mkdir(parents=True, exist_ok=True)
     env = KinematicUUVEnv(max_steps=2_000)
     rows = []
     try:
@@ -152,7 +154,7 @@ def main():
 
     json_path = args.output / "kinematic_benchmark.json"
     json_path.write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
-    csv_path = args.output / "kinematic_benchmark.csv"
+    csv_path = csv_dir / "kinematic_benchmark.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
@@ -186,4 +188,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

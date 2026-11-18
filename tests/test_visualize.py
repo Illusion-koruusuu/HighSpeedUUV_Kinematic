@@ -4,10 +4,24 @@ from pathlib import Path
 
 import numpy as np
 
-from training.visualize import _summary, plot_trajectory
+from training.visualize import _summary, _trajectory_files, plot_trajectory
 
 
 class VisualizationTests(unittest.TestCase):
+    def test_trajectory_files_can_be_filtered_by_seed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for speed in (10, 20):
+                for seed in (0, 5):
+                    (root / f"speed{speed}_seed{seed}.npz").touch()
+            files = _trajectory_files(
+                root, speeds=[20.0], seeds=[5], max_trajectories=10
+            )
+            self.assertEqual(
+                [file.name for file in files],
+                ["speed20_seed5.npz"],
+            )
+
     def test_trajectory_diagnostics_are_created(self):
         steps = 20
         position = np.column_stack((

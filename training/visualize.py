@@ -12,7 +12,8 @@ import numpy as np
 from kinematic_uuv.env import KNOT_MPS
 
 
-def _trajectory_files(path, speeds, max_trajectories):
+def _trajectory_files(path, speeds, seeds, max_trajectories,
+                      max_per_speed=None):
     if path.is_dir():
         search_dir = path / "trajectories" if (path / "trajectories").is_dir() else path
         files = sorted(search_dir.glob("*.npz"))
@@ -25,6 +26,26 @@ def _trajectory_files(path, speeds, max_trajectories):
             if match and float(match.group(1)) in speeds:
                 filtered.append(file)
         files = filtered
+    if seeds:
+        filtered = []
+        for file in files:
+            match = re.search(r"_seed([0-9]+)\.npz$", file.name)
+            if match and int(match.group(1)) in seeds:
+                filtered.append(file)
+        files = filtered
+    if max_per_speed is not None:
+        selected = []
+        counts = {}
+        for file in files:
+            match = re.match(r"speed([0-9.]+)_", file.stem)
+            if not match:
+                continue
+            speed = float(match.group(1))
+            if counts.get(speed, 0) >= max_per_speed:
+                continue
+            counts[speed] = counts.get(speed, 0) + 1
+            selected.append(file)
+        files = selected
     return files[:max_trajectories]
 
 
@@ -175,18 +196,25 @@ def main():
         help=".npz file, trajectory directory, or evaluation output directory",
     )
     parser.add_argument("--output", type=Path,
-                        default=Path("runs/kinematic_visualization"))
+                        default=Path("output_model/kinematic_visualization"))
     parser.add_argument("--max-trajectories", type=int, default=20)
+    parser.add_argument(
+        "--max-per-speed", type=int,
+        help="optional limit on selected trajectories for each speed",
+    )
     parser.add_argument("--speeds-knots", type=float, nargs="+")
+    parser.add_argument("--seeds", type=int, nargs="+")
     parser.add_argument("--dt", type=float, default=0.1)
     args = parser.parse_args()
     if not args.trajectory.exists():
         parser.error(f"trajectory path does not exist: {args.trajectory}")
-    if args.max_trajectories <= 0 or args.dt <= 0.0:
+    if (args.max_trajectories <= 0 or args.dt <= 0.0
+            or (args.max_per_speed is not None and args.max_per_speed <= 0)):
         parser.error("max-trajectories and dt must be positive")
 
     files = _trajectory_files(
-        args.trajectory, args.speeds_knots, args.max_trajectories
+        args.trajectory, args.speeds_knots, args.seeds,
+        args.max_trajectories, args.max_per_speed,
     )
     if not files:
         parser.error("no matching .npz trajectory files found")

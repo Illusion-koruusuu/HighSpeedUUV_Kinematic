@@ -47,6 +47,9 @@ cd /path/to/HighSpeedUUV_Kinematic
 - 最大俯仰角和俯仰角速度
 - 偏航/俯仰角加速度限制
 
+场景默认在整个三维规划空间中均匀随机生成 20–32 个障碍物。
+障碍半径采用 4–22 m 的混合分布，其中包含更多 14–22 m 的大半径障碍物。
+
 这样高速时自动限制转弯角速度，避免“高速大角度急转弯”。
 
 ## 观测
@@ -71,7 +74,10 @@ motion : 当前速度、巡航速度、速度上下限、偏航率、俯仰、�
 
 ```bash
 cd /path/to/HighSpeedUUV_Kinematic
-./scripts/train.sh --timesteps 500000 --output runs/kinematic_ppo --overwrite
+./scripts/train.sh \
+  --timesteps 500000 \
+  --output output_model/kinematic_ppo \
+  --overwrite
 ```
 
 训练默认使用 `cuda`、64 路并行采样和 A100 的 TF32 加速。可通过
@@ -88,15 +94,17 @@ BC 数据量可通过 `--bc-steps` 和 `--bc-val-steps` 调整。成功率门槛
 - `bc_model.zip`：BC 初始化模型
 - `best_eval.json`：最佳模型评估
 - `run.json`：完整运动学和训练配置
+- `csv/progress.csv`：训练曲线
+- `csv/monitors/`：各并行环境的回合记录
 
 ## 评估
 
 默认分别在 10、20、30、40、50 节各运行 20 回合：
 
 ```bash
-./scripts/evaluate.sh runs/kinematic_ppo/ppo_kinematic.zip \
+./scripts/evaluate.sh output_model/kinematic_ppo/ppo_kinematic.zip \
   --episodes-per-speed 20 --seed 0 \
-  --output runs/kinematic_eval
+  --output output_model/kinematic_eval
 ```
 
 策略评估默认使用 `--device cuda`；如需显式指定 GPU，可传入
@@ -104,8 +112,8 @@ BC 数据量可通过 `--bc-steps` 和 `--bc-val-steps` 调整。成功率门槛
 
 输出：
 
-- `evaluation_metrics.csv`：逐回合结果
-- `evaluation_summary.csv`：按速度分组汇总
+- `csv/evaluation_metrics.csv`：逐回合结果
+- `csv/evaluation_summary.csv`：按速度分组汇总
 - `evaluation_summary.json`
 - `evaluation.png`
 - `trajectories/*.npz`：可用于 HoloOcean 回放的轨迹
@@ -130,25 +138,43 @@ BC 数据量可通过 `--bc-steps` 和 `--bc-val-steps` 调整。成功率门槛
 障碍物净距：
 
 ```bash
-./scripts/evaluate.sh runs/fix_bc_100k/bc_model.zip \
+./scripts/evaluate.sh output_model/kinematic_ppo_v2/ppo_kinematic.zip \
   --episodes-per-speed 5 --seed 1000 \
-  --output runs/kinematic_viz_eval
+  --output output_model/kinematic_viz_eval
 
-./scripts/visualize.sh runs/kinematic_viz_eval \
-  --output runs/kinematic_visualization \
+./scripts/visualize.sh output_model/kinematic_viz_eval \
+  --output output_model/kinematic_visualization \
   --speeds-knots 10 20 30 40 50 \
+  --seeds 0 \
   --max-trajectories 10
 ```
+
+`--seeds` 可以选择一个或多个评估种子，例如 `--seeds 5` 或
+`--seeds 0 5 10`；需要同时播放指定轨迹时，使用对应的 `.npz` 文件即可。
 
 也可以只可视化一个轨迹：
 
 ```bash
 ./scripts/visualize.sh \
-  runs/kinematic_viz_eval/trajectories/speed20_seed1000.npz
+  output_model/kinematic_viz_eval/trajectories/speed20_seed1000.npz
 ```
 
 输出包括 `*_diagnostics.png` 和 `visualization_summary.json`。后者记录成功率、
 最终目标距离、最小障碍物净距、最大俯仰角、最大偏航角速度和最大横向加速度。
+
+## 场景分布可视化
+
+批量生成默认场景并检查障碍物在三维空间中的分布：
+
+```bash
+./scripts/visualize_scenes.sh \
+  --output output_model/scene_preview_uniform \
+  --num-scenes 12 \
+  --seed-start 3000
+```
+
+每个场景输出 3D、XY、XZ、YZ 四个视图，并额外生成
+`overview_xy.png` 总览图和 `scene_summary.json`。
 
 ## 实时播放单条轨迹
 
@@ -156,7 +182,7 @@ BC 数据量可通过 `--bc-steps` 和 `--bc-val-steps` 调整。成功率门槛
 
 ```bash
 ./scripts/play.sh \
-  runs/kinematic_viz_eval/trajectories/speed20_seed1000.npz \
+  output_model/kinematic_viz_eval/trajectories/speed20_seed1000.npz \
   --backend TkAgg --speed 1.0
 ```
 
@@ -164,8 +190,8 @@ BC 数据量可通过 `--bc-steps` 和 `--bc-val-steps` 调整。成功率门槛
 
 ```bash
 ./scripts/play.sh \
-  runs/kinematic_viz_eval/trajectories/speed20_seed1000.npz \
-  --save runs/kinematic_viz_eval/speed20_playback.mp4
+  output_model/kinematic_viz_eval/trajectories/speed20_seed1000.npz \
+  --save output_model/kinematic_viz_eval/speed20_playback.mp4
 ```
 
 `--speed 0.5` 为半速播放，`--speed 2` 为二倍速；`--trail-seconds 8` 控制
@@ -178,7 +204,7 @@ BC 数据量可通过 `--bc-steps` 和 `--bc-val-steps` 调整。成功率门槛
 
 ```bash
 ./scripts/replay_holoocean.sh \
-  runs/kinematic_eval/trajectories/speed50_seed0.npz
+  output_model/kinematic_eval/trajectories/speed50_seed0.npz
 ```
 
 回放过程：
